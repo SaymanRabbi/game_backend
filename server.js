@@ -10,8 +10,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+  },
 });
 
 let gameData = {
@@ -22,27 +22,38 @@ let gameData = {
   currentBets: {},
   isRoundActive: false,
   roundEndTime: null,
-  roundStartTime: null // store round start time for syncing
 };
 
 const GAME_DURATION = 10; // 10 seconds
 
 const startNewRound = () => {
+  // Only start a new round if one isn't already active
+  if (gameData.isRoundActive) {
+    console.log("Cannot start new round, game already active");
+    return;
+  }
+
   gameData.isRoundActive = true;
-  gameData.roundStartTime = Date.now();
-  gameData.roundEndTime = gameData.roundStartTime + (GAME_DURATION * 1000);
+  gameData.roundEndTime = Date.now() + GAME_DURATION * 1000;
+
+  console.log("Game started!");
 
   io.emit("game-start", {
     duration: GAME_DURATION,
-    startTime: gameData.roundStartTime
+    startTime: Date.now(),
   });
 
-  // End round after GAME_DURATION
+  // Schedule round end
   setTimeout(() => endRound(), GAME_DURATION * 1000);
 };
 
 const endRound = () => {
-  if (!gameData.isRoundActive) return;
+  if (!gameData.isRoundActive) {
+    console.log("Cannot end round, no active game");
+    return;
+  }
+
+  console.log("Ending round...");
 
   const totalHead = Object.values(gameData.head).reduce((acc, val) => acc + val, 0);
   const totalTale = Object.values(gameData.tale).reduce((acc, val) => acc + val, 0);
@@ -53,9 +64,11 @@ const endRound = () => {
   else winner = "draw";
 
   gameData.gameHistory = [...gameData.gameHistory.slice(-9), winner];
+
   const streak = calculateStreak(gameData.gameHistory);
   const multiplier = calculateMultiplier(streak);
 
+  // Calculate results for each player
   const playerResults = {};
   for (const [playerId, betData] of Object.entries(gameData.currentBets)) {
     const didWin = betData.side === winner;
@@ -64,9 +77,13 @@ const endRound = () => {
       won: didWin,
       amount: winAmount,
       originalBet: betData.amount,
-      side: betData.side
+      side: betData.side,
     };
   }
+
+  // Mark game as ended immediately
+  gameData.isRoundActive = false;
+  gameData.roundEndTime = null;
 
   io.emit("game-result", {
     totalHead,
@@ -75,35 +92,35 @@ const endRound = () => {
     streak,
     multiplier,
     history: gameData.gameHistory,
-    playerResults
+    playerResults,
   });
 
-  // Prepare for next round
+  // Reset for next round
   setTimeout(() => {
     gameData.head = {};
     gameData.tale = {};
     gameData.currentBets = {};
-    gameData.isRoundActive = false;
-    gameData.roundEndTime = null;
-    gameData.roundStartTime = null;
 
     io.emit("reset-game");
 
-    if (gameData.activePlayers.size > 0) {
-      startNewRound();
-    }
+    console.log("Game reset. Waiting for new bets...");
   }, 3000);
 };
 
 const calculateStreak = (history) => {
   if (history.length === 0) return 0;
+
   let streak = 1;
   const lastWinner = history[history.length - 1];
+
   for (let i = history.length - 2; i >= 0; i--) {
     if (history[i] === lastWinner) {
       streak++;
-    } else break;
+    } else {
+      break;
+    }
   }
+
   return streak;
 };
 
@@ -117,27 +134,33 @@ io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
   gameData.activePlayers.add(socket.id);
 
+  // Send current game state
   socket.emit("game-history", {
     history: gameData.gameHistory,
-    activePlayers: Array.from(gameData.activePlayers)
+    activePlayers: Array.from(gameData.activePlayers),
   });
 
-  // Start game if it's the first player
-  if (gameData.activePlayers.size === 1 && !gameData.isRoundActive) {
-    startNewRound();
-  } else if (gameData.isRoundActive) {
-    socket.emit("game-start", {
-      duration: GAME_DURATION,
-      startTime: gameData.roundStartTime,
-      currentBets: gameData.currentBets
-    });
-  }
+  // Broadcast updated active players list
+  io.emit("update-active-players", {
+    activePlayers: Array.from(gameData.activePlayers),
+  });
 
+  // Listen for bets
   socket.on("play", ({ side, point }) => {
-    if (!gameData.isRoundActive) return;
+    console.log(`Player ${socket.id} placed bet: ${point} on ${side}`);
+    
+    if (gameData.currentBets[socket.id]) {
+      console.log(`Player ${socket.id} already placed a bet`);
+      return;
+    }
 
-    if (gameData.currentBets[socket.id]) return; // Prevent same player from betting twice
+    // Start a new round if one isn't active
+    if (!gameData.isRoundActive) {
+      console.log("First bet placed. Starting game...");
+      startNewRound();
+    }
 
+    // Record the bet
     if (side === "head") {
       gameData.head[socket.id] = point;
     } else if (side === "tale") {
@@ -146,9 +169,9 @@ io.on("connection", (socket) => {
 
     gameData.currentBets[socket.id] = {
       side,
-      amount: point
+      amount: point,
     };
-
+    
     const totalHead = Object.values(gameData.head).reduce((acc, val) => acc + val, 0);
     const totalTale = Object.values(gameData.tale).reduce((acc, val) => acc + val, 0);
 
@@ -158,8 +181,8 @@ io.on("connection", (socket) => {
       newBet: {
         playerId: socket.id,
         side,
-        amount: point
-      }
+        amount: point,
+      },
     });
   });
 
@@ -170,15 +193,20 @@ io.on("connection", (socket) => {
     delete gameData.head[socket.id];
     delete gameData.tale[socket.id];
 
-    io.emit("player-left", {
-      playerId: socket.id,
-      activePlayers: Array.from(gameData.activePlayers)
+    // Broadcast updated active players list
+    io.emit("update-active-players", {
+      activePlayers: Array.from(gameData.activePlayers),
     });
 
+    io.emit("player-left", {
+      playerId: socket.id,
+      activePlayers: Array.from(gameData.activePlayers),
+    });
+
+    // If no players left, stop the round
     if (gameData.activePlayers.size === 0) {
       gameData.isRoundActive = false;
       gameData.roundEndTime = null;
-      gameData.roundStartTime = null;
     }
   });
 });
